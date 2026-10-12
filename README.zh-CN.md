@@ -26,7 +26,7 @@ Intel ISA-L（`igzip`）是一个**压缩库**——它只产原始 Deflate/gzip
 * **对 OOXML/OPC 安全**：`--root` 把目录内容放到归档根，并强制 `[Content_Types].xml` 为第一个条目。
 
 每次 [Release](https://github.com/x15967311210-crypto/isal-zip/releases) 都附带预编译的
-`isal_zip.exe` + `isa-l.dll`。
+`isal_zip.exe` + `isal_zip.dll` + `isa-l.dll`。
 
 ## 基准结果
 
@@ -96,12 +96,13 @@ ISA-L lvl3 / 7z `-mx9` ≈ **139–242×**。
 在 MSYS2 / MinGW shell 中：
 
 ```bash
-./build.sh                  # 克隆 ISA-L v2.32.1，编译 dll + exe
+./build.sh                  # 克隆 ISA-L v2.32.1，编译 dll + exe + isal_zip.dll
 ```
 
-两个脚本都会克隆 Intel ISA-L（默认 `v2.32.1`）、编译 `isa-l.dll`，再编译
-`src\isal_zip.c` 链接它。用 `-IsaLSrc` / `ISAL_SRC` 复用已有源码目录。
-CI（`.github/workflows/ci.yml`）会在 `windows-latest` 上构建并跑 smoke test。
+两个脚本都会克隆 Intel ISA-L（默认 `v2.32.1`）、编译 `isa-l.dll`，再把
+`src\isal_zip.c` 编两遍：一遍是 `isal_zip.exe`，一遍加 `-DISAL_ZIP_DLL` 编成
+`isal_zip.dll`（导出 `isal_zip_pack`）。用 `-IsaLSrc` / `ISAL_SRC` 复用已有源码目录。
+CI（`.github/workflows/ci.yml`）会在 `windows-latest` 上构建并跑 exe 与 dll 的 smoke test。
 
 ## 用法
 
@@ -124,6 +125,53 @@ isal_zip <level> <out.zip> [--root] <文件或目录1> [<文件或目录2> ...]
 .\isal_zip.exe 1 out.docx --root .\unpacked_docx
 ```
 
+## 用 DLL 直接导出 zip（`isal_zip.dll`）
+
+同一个 ZIP 写入器也导出成动态库，宿主进程可以直接打包，不必再去调用 `isal_zip.exe`。
+只导出一个函数：
+
+```c
+int isal_zip_pack(const char *outZip, const char *rootDir, int level, int threads);
+```
+
+| 参数 | 含义 |
+| --- | --- |
+| `outZip` | 输出 `.zip` 全路径 |
+| `rootDir` | 源目录；其**内容**放到归档根（等价于 `--root`） |
+| `level` | ISA-L 档位 `0..3` |
+| `threads` | 并行线程数（`<= 1` 为单线程） |
+
+成功返回 `0`，失败返回非 0（路径参数为空返回 `2`）。因为源目录直接放在归档根，
+同样遵守 OPC 规则：若存在 `[Content_Types].xml`，会强制它成为第一个条目。
+
+`isal_zip.dll` 与 `isa-l.dll` 需在 DLL 搜索路径上（放在宿主程序旁边，或某个 `PATH`
+目录里）。`ISAL_ZIP_FORCE64=1` 仍可强制 ZIP64；`ISAL_ZIP_VERBOSE=1` 可让 DLL 也
+打印 exe 那行统计（默认静默，避免污染宿主输出）。
+
+Python 调用示例：
+
+```python
+import ctypes
+lib = ctypes.CDLL(r"C:\path\to\isal_zip.dll")
+lib.isal_zip_pack.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+lib.isal_zip_pack.restype = ctypes.c_int
+rc = lib.isal_zip_pack(b"out.docx", b"unpacked_docx", 1, 8)   # 0 表示成功
+```
+
+SAS 调用示例（SASCBTBL / `modulen`）：
+
+```sas
+filename sascbtbl "your\sascbtbl.dsc";
+data _null_;
+  file sascbtbl;
+  put "routine isal_zip_pack minarg=4 maxarg=4 module=isal_zip stackpop=called returns=long;";
+  put " arg 1 char        input format=$CSTR1024.;";
+  put " arg 2 char        input format=$CSTR1024.;";
+  put " arg 3 num byvalue input format=PIB4.      ;";
+  put " arg 4 num byvalue input format=PIB4.      ;";
+run;
+```
+
 ## OOXML / OPC 要点
 
 `.docx`/`.xlsx`/`.pptx` 本质是受 Open Packaging Conventions 约束的 ZIP。对写入器有两条关键规则：
@@ -142,8 +190,9 @@ isal_zip <level> <out.zip> [--root] <文件或目录1> [<文件或目录2> ...]
 
 ```
 src/isal_zip.c        基于 Intel ISA-L isal_deflate_stateless() 的 ZIP 写入器
-build.ps1 / build.sh  构建 isa-l.dll + isal_zip.exe（PowerShell / MSYS2）
-.github/workflows/    CI：在 windows-latest 上构建 + smoke test
+                      （同一份源码编成 isal_zip.exe 和 isal_zip.dll）
+build.ps1 / build.sh  构建 isa-l.dll + isal_zip.exe + isal_zip.dll（PowerShell / MSYS2）
+.github/workflows/    CI：在 windows-latest 上构建 + exe/dll smoke test
 bench/bench_isal.py   ISA-L（python-isal）vs 7z vs zlib，单流
 bench/bench_zip.py    isal_zip.exe vs 7z，文件或文件夹（端到端）
 ```

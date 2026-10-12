@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build Intel ISA-L (isa-l.dll) and isal_zip.exe with MinGW-w64 + NASM + CMake.
+# Build Intel ISA-L (isa-l.dll) + isal_zip.exe + isal_zip.dll with MinGW-w64 + NASM + CMake.
 # Intended for MSYS2 / MinGW on Windows. For a native Windows shell use build.ps1.
 #
 #   ./build.sh                 # clones ISA-L v2.32.1 into .build/ and builds
@@ -33,9 +33,10 @@ echo "Configuring ISA-L ..."
 echo "Building isa-l.dll ..."
 "$CMAKE" --build "$BLD" -j
 
-echo "Building isal_zip.exe ..."
-gcc -O2 "$ROOT/src/isal_zip.c" "$BLD/isa-l.dll.a" \
-    -I "$BLD/build_include" -I "$ISAL_SRC/include" -o "$ROOT/isal_zip.exe"
+echo "Building isal_zip.exe and isal_zip.dll ..."
+INC=(-I "$BLD/build_include" -I "$ISAL_SRC/include")
+gcc -O2 "$ROOT/src/isal_zip.c" "$BLD/isa-l.dll.a" "${INC[@]}" -o "$ROOT/isal_zip.exe"
+gcc -O2 -shared -static-libgcc -DISAL_ZIP_DLL "$ROOT/src/isal_zip.c" "$BLD/isa-l.dll.a" "${INC[@]}" -o "$ROOT/isal_zip.dll"
 
 cp "$BLD/isa-l.dll" "$ROOT/"
-echo "OK -> $ROOT/isal_zip.exe  +  $ROOT/isa-l.dll"
+echo "OK -> $ROOT/isal_zip.exe  +  $ROOT/isal_zip.dll (isal_zip_pack)  +  $ROOT/isa-l.dll"

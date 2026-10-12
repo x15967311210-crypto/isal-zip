@@ -34,7 +34,7 @@ minimal, spec-conformant ZIP writer and measures how it stacks up against
 * **OOXML/OPC safe**: `--root` puts a folder's contents at the archive root and
   `[Content_Types].xml` is forced to be the first entry.
 
-Prebuilt `isal_zip.exe` + `isa-l.dll` are attached to each
+Prebuilt `isal_zip.exe` + `isal_zip.dll` + `isa-l.dll` are attached to each
 [release](https://github.com/x15967311210-crypto/isal-zip/releases).
 
 ## Benchmark results
@@ -106,13 +106,14 @@ scales the same way via `ISAL_ZIP_THREADS`.)
 From an MSYS2 / MinGW shell:
 
 ```bash
-./build.sh                  # clones ISA-L v2.32.1, builds dll + exe
+./build.sh                  # clones ISA-L v2.32.1; builds isa-l.dll + isal_zip.exe + isal_zip.dll
 ```
 
 Both scripts clone Intel ISA-L (default `v2.32.1`), build `isa-l.dll`, then
-compile `src\isal_zip.c` against it. Use `-IsaLSrc` / `ISAL_SRC` to reuse an
-existing checkout. CI (`.github/workflows/ci.yml`) builds and smoke-tests on
-`windows-latest`.
+compile `src\isal_zip.c` twice against it: once as `isal_zip.exe`, and once with
+`-DISAL_ZIP_DLL` as `isal_zip.dll` (which exports `isal_zip_pack`). Use
+`-IsaLSrc` / `ISAL_SRC` to reuse an existing checkout. CI
+(`.github/workflows/ci.yml`) builds and smoke-tests both on `windows-latest`.
 
 ## Usage
 
@@ -134,6 +135,55 @@ Examples:
 
 # package an unpacked OOXML package (contents at the root) -> openable .docx
 .\isal_zip.exe 1 out.docx --root .\unpacked_docx
+```
+
+## Using the DLL (`isal_zip.dll`)
+
+The same ZIP writer is exported as a shared library so a host process can pack
+directly — no shelling out to `isal_zip.exe`. One function is exported:
+
+```c
+int isal_zip_pack(const char *outZip, const char *rootDir, int level, int threads);
+```
+
+| arg | meaning |
+| --- | --- |
+| `outZip` | full path of the `.zip` to write |
+| `rootDir` | source folder; its **contents** go to the archive root (like `--root`) |
+| `level` | ISA-L level `0..3` |
+| `threads` | parallel worker threads (`<= 1` means single-threaded) |
+
+Returns `0` on success, non-zero on failure (`2` for a null/empty path argument).
+Because the source folder is packed *at the archive root*, the OPC first-entry
+rule applies: `[Content_Types].xml`, if present, is forced to be the first entry.
+
+`isal_zip.dll` and `isa-l.dll` must be on the DLL search path (e.g. next to the
+host executable, or a directory on `PATH`). `ISAL_ZIP_FORCE64=1` still forces
+ZIP64 records; set `ISAL_ZIP_VERBOSE=1` to get the one-line summary that the exe
+prints (silent by default so it does not pollute a host's output).
+
+Calling it from Python:
+
+```python
+import ctypes
+lib = ctypes.CDLL(r"C:\path\to\isal_zip.dll")
+lib.isal_zip_pack.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+lib.isal_zip_pack.restype = ctypes.c_int
+rc = lib.isal_zip_pack(b"out.docx", b"unpacked_docx", 1, 8)   # 0 == ok
+```
+
+Calling it from SAS (SASCBTBL / `modulen`):
+
+```sas
+filename sascbtbl "your\sascbtbl.dsc";
+data _null_;
+  file sascbtbl;
+  put "routine isal_zip_pack minarg=4 maxarg=4 module=isal_zip stackpop=called returns=long;";
+  put " arg 1 char        input format=$CSTR1024.;";
+  put " arg 2 char        input format=$CSTR1024.;";
+  put " arg 3 num byvalue input format=PIB4.      ;";
+  put " arg 4 num byvalue input format=PIB4.      ;";
+run;
 ```
 
 ## OOXML / OPC notes
@@ -159,8 +209,9 @@ Not implemented: encryption, data descriptors. (Neither is needed for OOXML.)
 
 ```
 src/isal_zip.c        ZIP writer built on Intel ISA-L's isal_deflate_stateless()
-build.ps1 / build.sh  build isa-l.dll + isal_zip.exe (PowerShell / MSYS2)
-.github/workflows/    CI: build + smoke test on windows-latest
+                      (compiled as both isal_zip.exe and isal_zip.dll)
+build.ps1 / build.sh  build isa-l.dll + isal_zip.exe + isal_zip.dll (PowerShell / MSYS2)
+.github/workflows/    CI: build + smoke test (exe and dll) on windows-latest
 bench/bench_isal.py   ISA-L (python-isal) vs 7z vs zlib, single stream
 bench/bench_zip.py    isal_zip.exe vs 7z, file or folder (end-to-end)
 ```

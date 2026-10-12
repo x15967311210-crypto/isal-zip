@@ -1,13 +1,14 @@
 <#
 .SYNOPSIS
-    Build Intel ISA-L (isa-l.dll) and isal_zip.exe on Windows.
+    Build Intel ISA-L (isa-l.dll), isal_zip.exe and isal_zip.dll on Windows.
 
 .DESCRIPTION
     isal_zip links Intel ISA-L's igzip Deflate engine, so ISA-L must be compiled
     first. This script:
       1. clones Intel ISA-L (unless -IsaLSrc points at an existing checkout)
       2. configures + builds isa-l.dll with CMake + NASM + MinGW gcc
-      3. compiles src\isal_zip.c and links it against isa-l.dll
+      3. compiles src\isal_zip.c into isal_zip.exe (CLI) and, with
+         -DISAL_ZIP_DLL, into isal_zip.dll (exports isal_zip_pack)
 
     Requirements on PATH (or pass explicit paths): nasm, gcc (MinGW-w64/x86_64),
     cmake, the generator's build tool (mingw32-make for "MinGW Makefiles", ninja
@@ -70,16 +71,22 @@ $dll = Join-Path $bld "isa-l.dll"
 $imp = Join-Path $bld "isa-l.dll.a"
 if (-not (Test-Path $dll)) { throw "isa-l.dll not produced" }
 
+$src = Join-Path $PSScriptRoot "src\isal_zip.c"
+$inc = @("-I", (Join-Path $bld "build_include"), "-I", (Join-Path $IsaLSrc "include"))
+
 Write-Host "Building isal_zip.exe ..."
-$out = Join-Path $PSScriptRoot "isal_zip.exe"
-& $Gcc -O2 (Join-Path $PSScriptRoot "src\isal_zip.c") $imp `
-    -I (Join-Path $bld "build_include") `
-    -I (Join-Path $IsaLSrc "include") `
-    -o $out
+$exe = Join-Path $PSScriptRoot "isal_zip.exe"
+& $Gcc -O2 $src $imp @inc -o $exe
 if ($LASTEXITCODE -ne 0) { throw "isal_zip compile failed" }
 
-Copy-Item $dll $PSScriptRoot -Force   # ship isa-l.dll next to the exe
+Write-Host "Building isal_zip.dll ..."
+$zipdll = Join-Path $PSScriptRoot "isal_zip.dll"
+& $Gcc -O2 -shared -static-libgcc -DISAL_ZIP_DLL $src $imp @inc -o $zipdll
+if ($LASTEXITCODE -ne 0) { throw "isal_zip.dll compile failed" }
+
+Copy-Item $dll $PSScriptRoot -Force   # ship isa-l.dll next to the exe/dll
 Write-Host ""
-Write-Host "OK -> $out" -ForegroundColor Green
+Write-Host "OK -> $exe" -ForegroundColor Green
+Write-Host "     $zipdll        (exports isal_zip_pack)"
 Write-Host "     $PSScriptRoot\isa-l.dll"
 Write-Host "Try:  .\isal_zip.exe 1 out.zip --root <folder>"

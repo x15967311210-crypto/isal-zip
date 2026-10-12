@@ -1,17 +1,36 @@
 /* isal_zip: produce a real .zip archive whose payloads are compressed by Intel ISA-L.
  *
+ * Ships two ways from the same source:
+ *   isal_zip.exe   command-line packer
+ *   isal_zip.dll   library module exporting isal_zip_pack() so other tools
+ *                  (e.g. SAS via SASCBTBL / modulen) can pack a folder directly,
+ *                  without shelling out to the exe.
+ *
  * Supports: recursive folders, multiple threads, ZIP64 (for >4 GiB parts /
  * >65535 entries), the UTF-8 filename flag, explicit directory entries, and a
  * "store" fallback when Deflate does not shrink a part. Safe for OOXML/OPC.
  *
- * Usage: isal_zip <level> <out.zip> [--root] <file-or-dir1> [<file-or-dir2> ...]
+ * Usage (exe): isal_zip <level> <out.zip> [--root] <file-or-dir1> [<file-or-dir2> ...]
  *   <level>  ISA-L level: 0=store, 1=fastest, 2, 3=best
  *   --root   store a directory's *contents* at the archive root (needed for OOXML/OPC)
  * Env:
  *   ISAL_ZIP_THREADS=N   compress N files in parallel (default 1)
  *   ISAL_ZIP_FORCE64=1   always emit ZIP64 records (for testing)
+ *   ISAL_ZIP_VERBOSE=1   print the one-line summary from the DLL (default: exe only)
  *
- * Build: gcc -O2 isal_zip.c <path>\isa-l.dll.a -I <build_include> -I <include> -o isal_zip.exe
+ * Library API (isal_zip.dll):
+ *   int isal_zip_pack(const char *outZip, const char *rootDir, int level, int threads);
+ *     outZip  : full path of the .zip to write
+ *     rootDir : source directory; its *contents* go to the archive root and
+ *               [Content_Types].xml (if present) is forced to be the first entry
+ *     level   : ISA-L level 0..3
+ *     threads : parallel worker threads (<=1 means single-threaded)
+ *     returns 0 on success, non-zero on failure
+ *
+ * Build:
+ *   gcc -O2 isal_zip.c <path>\isa-l.dll.a -I <build_include> -I <include> -o isal_zip.exe
+ *   gcc -O2 -shared -DISAL_ZIP_DLL isal_zip.c <path>\isa-l.dll.a \
+ *       -I <build_include> -I <include> -o isal_zip.dll
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +48,14 @@
 #define U32MAX_ 0xFFFFFFFFu
 #define U16MAX_ 0xFFFFu
 #define Z64_EXTRA_ID 0x0001u
+
+/* Compile with -DISAL_ZIP_DLL to emit a shared library that exports
+ * isal_zip_pack() instead of the isal_zip.exe entry point. */
+#ifdef ISAL_ZIP_DLL
+#  define ZIP_EXPORT __declspec(dllexport)
+#else
+#  define ZIP_EXPORT
+#endif
 
 static void put16(unsigned char *p, unsigned v) { p[0] = v; p[1] = v >> 8; }
 static void put32(unsigned char *p, uint32_t v) { p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]=v>>24; }
@@ -70,28 +97,42 @@ typedef struct {
     char name[NAMEMAX];
 } entry_t;
 
+#ifdef ISAL_ZIP_DLL
+static int g_verbose = 0;     /* quiet when loaded into a host process */
+#else
+static int g_verbose = 1;
+#endif
 static uint32_t g_level;
 static int g_force64;
+static int g_failed = 0;      /* set instead of exit() so a DLL never kills its host */
 static entry_t *g_ents = NULL;
 static int g_nfiles = 0, g_cap = 0;
 static volatile LONG g_next;
 
-static void add_entry(const char *path, const char *arcname) {
+static void reset_state(void) {
+    for (int i = 0; i < g_nfiles; i++) { free(g_ents[i].path); free(g_ents[i].blob); }
+    g_nfiles = 0;
+    g_next = 0;
+    g_failed = 0;
+}
+
+static int add_entry(const char *path, const char *arcname) {
     if (g_nfiles == g_cap) {
         g_cap = g_cap ? g_cap * 2 : 64;
         g_ents = (entry_t *)realloc(g_ents, sizeof(entry_t) * g_cap);
-        if (!g_ents) { fprintf(stderr, "oom\n"); exit(1); }
+        if (!g_ents) { fprintf(stderr, "oom\n"); g_failed = 1; return -1; }
     }
     entry_t *e = &g_ents[g_nfiles++];
     memset(e, 0, sizeof(*e));
     e->path = path ? _strdup(path) : NULL;
     strncpy(e->name, arcname, NAMEMAX - 1);
     e->gpflag = gpflag_for(e->name);
+    return 0;
 }
 
-static void walk(const char *dirpath, const char *prefix) {
+static int walk(const char *dirpath, const char *prefix) {
     DIR *d = opendir(dirpath);
-    if (!d) { fprintf(stderr, "cannot open dir %s\n", dirpath); return; }
+    if (!d) { fprintf(stderr, "cannot open dir %s\n", dirpath); g_failed = 1; return -1; }
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
@@ -103,20 +144,21 @@ static void walk(const char *dirpath, const char *prefix) {
         if (stat(full, &st) != 0) continue;
         if (S_ISDIR(st.st_mode)) {
             snprintf(dirent_name, sizeof(dirent_name), "%s/", rel);  /* explicit dir entry */
-            add_entry(NULL, dirent_name);
+            if (add_entry(NULL, dirent_name) != 0) break;
             walk(full, rel);
         } else if (S_ISREG(st.st_mode)) {
-            add_entry(full, rel);
+            if (add_entry(full, rel) != 0) break;
         }
     }
     closedir(d);
+    return g_failed ? -1 : 0;
 }
 
-static void collect(const char *arg, int root_mode) {
+static int collect(const char *arg, int root_mode) {
     struct stat st;
-    if (stat(arg, &st) != 0) { fprintf(stderr, "not found: %s\n", arg); exit(1); }
-    if (S_ISDIR(st.st_mode)) walk(arg, root_mode ? "" : base_name(arg));
-    else add_entry(arg, base_name(arg));
+    if (stat(arg, &st) != 0) { fprintf(stderr, "not found: %s\n", arg); g_failed = 1; return -1; }
+    if (S_ISDIR(st.st_mode)) return walk(arg, root_mode ? "" : base_name(arg));
+    return add_entry(arg, base_name(arg));
 }
 
 /* read one file, CRC it, deflate it with ISA-L (or store if that does not help) */
@@ -130,12 +172,14 @@ static int prepare(int i) {
     long long n = _ftelli64(in);
     fseek(in, 0, SEEK_SET);
     unsigned char *buf = (unsigned char *)malloc((size_t)n + 1);
-    if (fread(buf, 1, (size_t)n, in) != (size_t)n) { fprintf(stderr, "read err %s\n", e->path); return -1; }
+    if (!buf) { fclose(in); fprintf(stderr, "oom\n"); return -1; }
+    if (fread(buf, 1, (size_t)n, in) != (size_t)n) { fprintf(stderr, "read err %s\n", e->path); fclose(in); free(buf); return -1; }
     fclose(in);
 
     uint32_t crc = crc32_gzip_refl(0, buf, (size_t)n);
     size_t cap = (size_t)n + (size_t)n / 1000 + 4096;
     unsigned char *cmp = (unsigned char *)malloc(cap);
+    if (!cmp) { free(buf); fprintf(stderr, "oom\n"); return -1; }
 
     struct isal_zstream s;
     isal_deflate_stateless_init(&s);
@@ -283,26 +327,20 @@ static int write_archive(FILE *out) {
     return 0;
 }
 
-int main(int argc, char **argv) {
-    if (argc < 4) {
-        fprintf(stderr,
-            "usage: %s <level> <out.zip> [--root] <file-or-dir1> [more...]\n"
-            "  --root : store directory contents at the archive root (needed for OOXML/OPC)\n",
-            argv[0]);
-        return 2;
-    }
-    setlocale(LC_ALL, ".UTF-8");   /* so directory names round-trip as UTF-8 */
-    g_level = (uint32_t)atoi(argv[1]);
-    const char *outpath = argv[2];
-    g_force64 = getenv("ISAL_ZIP_FORCE64") != NULL;
+/* Shared core: pack `paths` into `outpath`. root_mode stores each directory's
+ * *contents* at the archive root and fixes up the OPC first-entry rule. */
+static int pack_archive(const char *outpath, int level, int threads, int force64,
+                        const char *const *paths, int npaths, int root_mode) {
+    reset_state();
+    g_level = (uint32_t)level;
+    g_force64 = force64;
+    if (threads < 1) threads = 1;
 
-    int root_mode = 0;
-    for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--root")) root_mode = 1;
-    for (int i = 3; i < argc; i++) {
-        if (!strcmp(argv[i], "--root")) continue;
-        collect(argv[i], root_mode);
+    for (int i = 0; i < npaths; i++) {
+        if (collect(paths[i], root_mode) != 0) return 1;
     }
     if (g_nfiles == 0) { fprintf(stderr, "no input files\n"); return 1; }
+
     /* OPC rule: the Content Types stream must be the first item in the archive */
     for (int i = 0; i < g_nfiles; i++) {
         if (!strcmp(g_ents[i].name, "[Content_Types].xml")) {
@@ -311,9 +349,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    const char *tenv = getenv("ISAL_ZIP_THREADS");
-    int threads = tenv ? atoi(tenv) : 1;
-    if (threads < 1) threads = 1;
     if (threads > g_nfiles) threads = g_nfiles;
 
     FILE *out = fopen(outpath, "wb");
@@ -321,9 +356,12 @@ int main(int argc, char **argv) {
 
     double t0 = now();
     if (threads <= 1) {
-        for (int i = 0; i < g_nfiles; i++) if (prepare(i) != 0) return 1;
+        for (int i = 0; i < g_nfiles; i++) {
+            if (prepare(i) != 0) { fclose(out); return 1; }
+        }
     } else {
         HANDLE *h = (HANDLE *)malloc(sizeof(HANDLE) * threads);
+        if (!h) { fclose(out); fprintf(stderr, "oom\n"); return 1; }
         for (int t = 0; t < threads; t++) h[t] = CreateThread(NULL, 0, worker, NULL, 0, NULL);
         WaitForMultipleObjects(threads, h, TRUE, INFINITE);
         for (int t = 0; t < threads; t++) CloseHandle(h[t]);
@@ -334,10 +372,70 @@ int main(int argc, char **argv) {
     double dt = now() - t0;
     if (rc != 0) return 1;
 
-    unsigned long long tin = 0, tout = 0;
-    int nent = 0;
-    for (int i = 0; i < g_nfiles; i++) { tin += g_ents[i].usize; tout += g_ents[i].csize; if (g_ents[i].path) nent++; }
-    printf("ISAL_ZIP lvl%u threads=%d files=%d in=%llu deflated=%llu ratio=%.3f time=%.4fs -> %s\n",
-           g_level, threads, nent, tin, tout, tout ? (double)tin / (double)tout : 0.0, dt, outpath);
+    if (g_verbose) {
+        unsigned long long tin = 0, tout = 0;
+        int nent = 0;
+        for (int i = 0; i < g_nfiles; i++) { tin += g_ents[i].usize; tout += g_ents[i].csize; if (g_ents[i].path) nent++; }
+        printf("ISAL_ZIP lvl%u threads=%d files=%d in=%llu deflated=%llu ratio=%.3f time=%.4fs -> %s\n",
+               g_level, threads, nent, tin, tout, tout ? (double)tin / (double)tout : 0.0, dt, outpath);
+    }
     return 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Library API (isal_zip.dll)                                          */
+/* ------------------------------------------------------------------ */
+
+/* Pack `rootDir`'s contents at the archive root, keeping [Content_Types].xml
+ * first so the result is a valid OOXML/OPC package. Returns 0 on success. */
+ZIP_EXPORT int isal_zip_pack(const char *outZip, const char *rootDir, int level, int threads) {
+    if (!outZip || !rootDir || !outZip[0] || !rootDir[0]) return 2;
+    setlocale(LC_ALL, ".UTF-8");   /* so directory names round-trip as UTF-8 */
+    g_verbose = getenv("ISAL_ZIP_VERBOSE") != NULL;
+    const char *paths[1] = { rootDir };
+    int rc = pack_archive(outZip, level, threads, getenv("ISAL_ZIP_FORCE64") != NULL, paths, 1, 1);
+    reset_state();                 /* free the blobs: the DLL may stay resident */
+    return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Command-line entry point (isal_zip.exe)                             */
+/* ------------------------------------------------------------------ */
+
+#ifndef ISAL_ZIP_DLL
+int main(int argc, char **argv) {
+    if (argc < 4) {
+        fprintf(stderr,
+            "usage: %s <level> <out.zip> [--root] <file-or-dir1> [more...]\n"
+            "  --root : store directory contents at the archive root (needed for OOXML/OPC)\n",
+            argv[0]);
+        return 2;
+    }
+    setlocale(LC_ALL, ".UTF-8");   /* so directory names round-trip as UTF-8 */
+
+    int level = atoi(argv[1]);
+    const char *outpath = argv[2];
+    int force64 = getenv("ISAL_ZIP_FORCE64") != NULL;
+
+    int root_mode = 0;
+    for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--root")) root_mode = 1;
+
+    const char **paths = (const char **)malloc(sizeof(char *) * (argc - 3 + 1));
+    if (!paths) { fprintf(stderr, "oom\n"); return 1; }
+    int npaths = 0;
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--root")) continue;
+        paths[npaths++] = argv[i];
+    }
+
+    const char *tenv = getenv("ISAL_ZIP_THREADS");
+    int threads = tenv ? atoi(tenv) : 1;
+
+    int rc = pack_archive(outpath, level, threads, force64, paths, npaths, root_mode);
+    free(paths);
+    reset_state();
+    free(g_ents);
+    g_ents = NULL; g_cap = 0;
+    return rc;
+}
+#endif

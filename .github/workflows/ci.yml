@@ -48,6 +48,7 @@ jobs:
           Set-Content smoke\a.txt "hello isal-zip"
           Set-Content smoke\sub\b.txt "nested file"
           Set-Content "smoke\cafe-测试.txt" "中文内容" -Encoding UTF8
+          Set-Content -LiteralPath "smoke\[Content_Types].xml" "<Types/>"
 
           .\isal_zip.exe 1 smoke.zip --root smoke
           if ($LASTEXITCODE) { throw "isal_zip failed" }
@@ -66,6 +67,26 @@ jobs:
             & $sevenZip t $z
             if ($LASTEXITCODE) { throw "7z t $z failed" }
           }
+
+          # isal_zip.dll: exercise the exported isal_zip_pack() via ctypes
+          @'
+          import ctypes, os, sys, zipfile
+          lib = ctypes.CDLL(os.path.abspath("isal_zip.dll"))
+          lib.isal_zip_pack.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+          lib.isal_zip_pack.restype = ctypes.c_int
+          rc = lib.isal_zip_pack(b"smoke_dll.zip", b"smoke", 1, 4)
+          print("isal_zip_pack ->", rc)
+          if rc:
+              sys.exit(rc)
+          names = zipfile.ZipFile("smoke_dll.zip").namelist()
+          print("first entry:", names[0])
+          sys.exit(0 if names[0] == "[Content_Types].xml" else 3)
+          '@ | Set-Content smoke_dll.py
+          python smoke_dll.py
+          if ($LASTEXITCODE) { throw "isal_zip.dll pack failed" }
+
+          & $sevenZip t smoke_dll.zip
+          if ($LASTEXITCODE) { throw "7z t smoke_dll.zip failed" }
           Write-Host "smoke tests passed"
 
       - name: Upload artifacts
@@ -74,5 +95,6 @@ jobs:
           name: isal-zip-win64
           path: |
             isal_zip.exe
+            isal_zip.dll
             isa-l.dll
           if-no-files-found: error
