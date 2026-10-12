@@ -1,0 +1,26 @@
+# build output
+.build/
+bin/
+*.dll
+*.lib
+*.a
+*.obj
+*.o
+*.exe
+*.pdb
+*.ilk
+
+# benchmark scratch / archives
+*.zip
+*.docx
+*.xlsx
+*.pptx
+
+# test data (large corpora are not committed)
+data/
+*.bin
+
+# editors / OS
+.vs/
+.vscode/
+Thumbs.db
