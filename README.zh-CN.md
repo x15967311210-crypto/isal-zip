@@ -150,6 +150,12 @@ int isal_zip_rmtree(const char *dir);
 （junction/符号链接只删链接本身）；**路径不存在也算成功返回 0**，所以可以放心
 当"用前先清"的幂等步骤。非 0（空参数返回 `2`）表示有东西没删掉。
 
+两个导出函数在**首次调用时会把本模块钉住**（`GetModuleHandleEx` +
+`GET_MODULE_HANDLE_EX_FLAG_PIN`）。对于"每次调用都加载/卸载 DLL"的宿主——SAS 的
+`MODULE(…)`/`MODULEN(…)` 就是每个 DATA 步加载、步末卸载——钉住后 DLL（连同
+`isa-l.dll`）会常驻：实测每步省掉约 1.5 ms 的加载/卸载开销。代价是宿主进程还活着时，
+磁盘上的 DLL 文件无法被覆盖。
+
 `isal_zip.dll` 与 `isa-l.dll` 需在 DLL 搜索路径上（放在宿主程序旁边，或某个 `PATH`
 目录里）。`ISAL_ZIP_FORCE64=1` 仍可强制 ZIP64；`ISAL_ZIP_VERBOSE=1` 可让 DLL 也
 打印 exe 那行统计（默认静默，避免污染宿主输出）。

@@ -31,6 +31,10 @@
  *     not exist (idempotent). Lets a host clean its scratch tree without
  *     spawning cmd.exe/rd.
  *
+ * Both exports pin the module on first use (GET_MODULE_HANDLE_EX_FLAG_PIN), so a
+ * host that loads/unloads the DLL per call (SAS MODULE per DATA step) keeps it
+ * resident instead of re-loading it -- and isa-l.dll with it -- every step.
+ *
  * Build:
  *   gcc -O2 isal_zip.c <path>\isa-l.dll.a -I <build_include> -I <include> -o isal_zip.exe
  *   gcc -O2 -shared -DISAL_ZIP_DLL isal_zip.c <path>\isa-l.dll.a \
@@ -391,6 +395,24 @@ static int pack_archive(const char *outpath, int level, int threads, int force64
 /* Library API (isal_zip.dll)                                          */
 /* ------------------------------------------------------------------ */
 
+#ifdef ISAL_ZIP_DLL
+/* Pin this module in the host process once. SAS's MODULE loader loads the DLL
+ * per DATA step and calls FreeLibrary when the step ends; pinning it
+ * (GET_MODULE_HANDLE_EX_FLAG_PIN) makes the unload a no-op, so the DLL -- and
+ * its isa-l.dll dependency, and its loaded state -- stay resident instead of
+ * being re-loaded/re-resolved for every step that calls us. */
+static void pin_module_once(void) {
+    static LONG pinned = 0;
+    if (InterlockedCompareExchange(&pinned, 1, 0) == 0) {
+        HMODULE h = NULL;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           (LPCSTR)(const void *)&pin_module_once, &h);
+    }
+}
+#else
+#define pin_module_once() ((void)0)
+#endif
+
 /* Join a directory with a child name using a backslash. */
 static wchar_t *wjoin(const wchar_t *dir, const wchar_t *child) {
     size_t ld = wcslen(dir), lc = wcslen(child);
@@ -433,6 +455,7 @@ static int rmtree_w(const wchar_t *path) {
 /* Recursively delete `dir` (UTF-8 path). Returns 0 on success -- including when
  * the path does not exist -- so callers can use it as an idempotent cleanup. */
 ZIP_EXPORT int isal_zip_rmtree(const char *dir) {
+    pin_module_once();
     if (!dir || !dir[0]) return 2;
     int n = MultiByteToWideChar(CP_UTF8, 0, dir, -1, NULL, 0);
     if (n <= 0) return 3;
@@ -455,6 +478,7 @@ ZIP_EXPORT int isal_zip_rmtree(const char *dir) {
 /* Pack `rootDir`'s contents at the archive root, keeping [Content_Types].xml
  * first so the result is a valid OOXML/OPC package. Returns 0 on success. */
 ZIP_EXPORT int isal_zip_pack(const char *outZip, const char *rootDir, int level, int threads) {
+    pin_module_once();
     if (!outZip || !rootDir || !outZip[0] || !rootDir[0]) return 2;
     setlocale(LC_ALL, ".UTF-8");   /* so directory names round-trip as UTF-8 */
     g_verbose = getenv("ISAL_ZIP_VERBOSE") != NULL;

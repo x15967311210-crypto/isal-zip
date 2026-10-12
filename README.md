@@ -165,6 +165,13 @@ returns `0` on success **including when the path does not exist**, so it can be
 used as an idempotent "clean before use" step. Non-zero (`2` for null/empty)
 means something could not be removed.
 
+Both exports pin the module on first use (`GetModuleHandleEx` +
+`GET_MODULE_HANDLE_EX_FLAG_PIN`). Hosts that load the DLL per call — SAS's
+`MODULE(…)`/`MODULEN(…)` loads it for each DATA step and unloads it when the
+step ends — therefore keep it (and `isa-l.dll`) resident: measured ~1.5 ms of
+load/unload saved per DATA step. The flip side of pinning: while a host process
+holds the DLL, the file cannot be replaced on disk.
+
 `isal_zip.dll` and `isa-l.dll` must be on the DLL search path (e.g. next to the
 host executable, or a directory on `PATH`). `ISAL_ZIP_FORCE64=1` still forces
 ZIP64 records; set `ISAL_ZIP_VERBOSE=1` to get the one-line summary that the exe
