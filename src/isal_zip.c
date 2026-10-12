@@ -1,15 +1,23 @@
 /* isal_zip: produce a real .zip archive whose payloads are compressed by Intel ISA-L.
- * Usage: isal_zip <level> <out.zip> <file-or-dir1> [<file-or-dir2> ...]
- *        directory args are walked recursively; entries are stored with the
- *        directory's base name as prefix (like `zip -r out.zip dir`).
- * Env  : ISAL_ZIP_THREADS=N   compress N files in parallel (default 1)
- * Writer: Local File Header + raw-deflate stream per file, then Central Directory + EOCD.
+ *
+ * Supports: recursive folders, multiple threads, ZIP64 (for >4 GiB parts /
+ * >65535 entries), the UTF-8 filename flag, explicit directory entries, and a
+ * "store" fallback when Deflate does not shrink a part. Safe for OOXML/OPC.
+ *
+ * Usage: isal_zip <level> <out.zip> [--root] <file-or-dir1> [<file-or-dir2> ...]
+ *   <level>  ISA-L level: 0=store, 1=fastest, 2, 3=best
+ *   --root   store a directory's *contents* at the archive root (needed for OOXML/OPC)
+ * Env:
+ *   ISAL_ZIP_THREADS=N   compress N files in parallel (default 1)
+ *   ISAL_ZIP_FORCE64=1   always emit ZIP64 records (for testing)
+ *
  * Build: gcc -O2 isal_zip.c <path>\isa-l.dll.a -I <build_include> -I <include> -o isal_zip.exe
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <locale.h>
 #include <windows.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -18,9 +26,16 @@
 
 #define NAMEMAX 1024
 #define PATHMAX 4096
+#define U32MAX_ 0xFFFFFFFFu
+#define U16MAX_ 0xFFFFu
+#define Z64_EXTRA_ID 0x0001u
 
 static void put16(unsigned char *p, unsigned v) { p[0] = v; p[1] = v >> 8; }
 static void put32(unsigned char *p, uint32_t v) { p[0]=v; p[1]=v>>8; p[2]=v>>16; p[3]=v>>24; }
+static void put64(unsigned char *p, uint64_t v) {
+    put32(p, (uint32_t)v);
+    put32(p + 4, (uint32_t)(v >> 32));
+}
 
 static double now(void) {
     LARGE_INTEGER f, c;
@@ -34,19 +49,29 @@ static const char *base_name(const char *p) {
     return r;
 }
 
+/* set the general-purpose UTF-8 name flag (bit 11) for non-ASCII names */
+static unsigned short gpflag_for(const char *name) {
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++)
+        if (*p >= 0x80) return 0x0800;
+    return 0;
+}
+
 static uint32_t lvl_buf_size(uint32_t level) {
     switch (level) { case 1: return ISAL_DEF_LVL1_DEFAULT; case 2: return ISAL_DEF_LVL2_DEFAULT; default: return ISAL_DEF_LVL3_DEFAULT; }
 }
 
 typedef struct {
-    char *path;               /* filesystem path */
-    uint32_t crc, csize, usize, off;
+    char *path;               /* filesystem path, or NULL for a directory entry */
+    uint64_t usize, csize, off;
+    uint32_t crc;
     unsigned short method;    /* 0 = store, 8 = deflate */
-    unsigned char *blob;      /* payload as written */
-    char name[NAMEMAX];       /* name stored in archive ('/' separated) */
+    unsigned short gpflag;
+    unsigned char *blob;
+    char name[NAMEMAX];
 } entry_t;
 
 static uint32_t g_level;
+static int g_force64;
 static entry_t *g_ents = NULL;
 static int g_nfiles = 0, g_cap = 0;
 static volatile LONG g_next;
@@ -59,8 +84,9 @@ static void add_entry(const char *path, const char *arcname) {
     }
     entry_t *e = &g_ents[g_nfiles++];
     memset(e, 0, sizeof(*e));
-    e->path = _strdup(path);
+    e->path = path ? _strdup(path) : NULL;
     strncpy(e->name, arcname, NAMEMAX - 1);
+    e->gpflag = gpflag_for(e->name);
 }
 
 static void walk(const char *dirpath, const char *prefix) {
@@ -69,14 +95,19 @@ static void walk(const char *dirpath, const char *prefix) {
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-        char full[PATHMAX], rel[NAMEMAX];
+        char full[PATHMAX], rel[NAMEMAX], dirent_name[NAMEMAX];
         snprintf(full, sizeof(full), "%s/%s", dirpath, de->d_name);
         if (prefix[0]) snprintf(rel, sizeof(rel), "%s/%s", prefix, de->d_name);
         else snprintf(rel, sizeof(rel), "%s", de->d_name);
         struct stat st;
         if (stat(full, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) walk(full, rel);
-        else if (S_ISREG(st.st_mode)) add_entry(full, rel);
+        if (S_ISDIR(st.st_mode)) {
+            snprintf(dirent_name, sizeof(dirent_name), "%s/", rel);  /* explicit dir entry */
+            add_entry(NULL, dirent_name);
+            walk(full, rel);
+        } else if (S_ISREG(st.st_mode)) {
+            add_entry(full, rel);
+        }
     }
     closedir(d);
 }
@@ -84,23 +115,22 @@ static void walk(const char *dirpath, const char *prefix) {
 static void collect(const char *arg, int root_mode) {
     struct stat st;
     if (stat(arg, &st) != 0) { fprintf(stderr, "not found: %s\n", arg); exit(1); }
-    if (S_ISDIR(st.st_mode)) {
-        walk(arg, root_mode ? "" : base_name(arg));  /* --root: contents go to archive root */
-    } else {
-        add_entry(arg, base_name(arg));
-    }
+    if (S_ISDIR(st.st_mode)) walk(arg, root_mode ? "" : base_name(arg));
+    else add_entry(arg, base_name(arg));
 }
 
-/* read one file, CRC it, deflate it with ISA-L into a fresh buffer */
+/* read one file, CRC it, deflate it with ISA-L (or store if that does not help) */
 static int prepare(int i) {
-    const char *path = g_ents[i].path;
-    FILE *in = fopen(path, "rb");
-    if (!in) { perror(path); return -1; }
+    entry_t *e = &g_ents[i];
+    if (!e->path) { e->method = 0; return 0; }   /* directory entry: empty */
+
+    FILE *in = fopen(e->path, "rb");
+    if (!in) { perror(e->path); return -1; }
     fseek(in, 0, SEEK_END);
     long long n = _ftelli64(in);
     fseek(in, 0, SEEK_SET);
     unsigned char *buf = (unsigned char *)malloc((size_t)n + 1);
-    if (fread(buf, 1, (size_t)n, in) != (size_t)n) { fprintf(stderr, "read err %s\n", path); return -1; }
+    if (fread(buf, 1, (size_t)n, in) != (size_t)n) { fprintf(stderr, "read err %s\n", e->path); return -1; }
     fclose(in);
 
     uint32_t crc = crc32_gzip_refl(0, buf, (size_t)n);
@@ -123,17 +153,17 @@ static int prepare(int i) {
     if (n > 0 && (size_t)csize >= (size_t)n) {
         /* Deflate did not help (e.g. already-compressed media): store raw. */
         free(cmp);
-        g_ents[i].blob = buf;            /* take ownership of the raw bytes */
-        g_ents[i].csize = (uint32_t)n;
-        g_ents[i].method = 0;
+        e->blob = buf;
+        e->csize = (uint64_t)n;
+        e->method = 0;
     } else {
         free(buf);
-        g_ents[i].blob = cmp;
-        g_ents[i].csize = csize;
-        g_ents[i].method = 8;
+        e->blob = cmp;
+        e->csize = (uint64_t)csize;
+        e->method = 8;
     }
-    g_ents[i].crc = crc;
-    g_ents[i].usize = (uint32_t)n;
+    e->crc = crc;
+    e->usize = (uint64_t)n;
     return 0;
 }
 
@@ -149,50 +179,122 @@ static DWORD WINAPI worker(LPVOID arg) {
 
 static int write_archive(FILE *out) {
     for (int i = 0; i < g_nfiles; i++) {
-        size_t nl = strlen(g_ents[i].name);
-        g_ents[i].off = (uint32_t)_ftelli64(out);
+        entry_t *e = &g_ents[i];
+        size_t nl = strlen(e->name);
+        e->off = (uint64_t)_ftelli64(out);
+        int z64s = g_force64 || e->usize >= U32MAX_ || e->csize >= U32MAX_;
+        unsigned short vneed = z64s ? 45 : 20;
+
         unsigned char lfh[30];
-        put32(lfh + 0, 0x04034b50);
-        put16(lfh + 4, 20); put16(lfh + 6, 0); put16(lfh + 8, g_ents[i].method);
+        put32(lfh + 0, 0x04034b50u);
+        put16(lfh + 4, vneed);
+        put16(lfh + 6, e->gpflag);
+        put16(lfh + 8, e->method);
         put16(lfh + 10, 0); put16(lfh + 12, 0x5A21);
-        put32(lfh + 14, g_ents[i].crc);
-        put32(lfh + 18, g_ents[i].csize);
-        put32(lfh + 22, g_ents[i].usize);
-        put16(lfh + 26, (uint16_t)nl); put16(lfh + 28, 0);
+        put32(lfh + 14, e->crc);
+        put32(lfh + 18, z64s ? U32MAX_ : (uint32_t)e->csize);
+        put32(lfh + 22, z64s ? U32MAX_ : (uint32_t)e->usize);
+        put16(lfh + 26, (uint16_t)nl);
+        put16(lfh + 28, z64s ? 20 : 0);
         fwrite(lfh, 1, 30, out);
-        fwrite(g_ents[i].name, 1, nl, out);
-        if (g_ents[i].csize) fwrite(g_ents[i].blob, 1, g_ents[i].csize, out);
+        fwrite(e->name, 1, nl, out);
+        if (z64s) {
+            unsigned char x[20];
+            put16(x + 0, Z64_EXTRA_ID); put16(x + 2, 16);
+            put64(x + 4, e->usize); put64(x + 12, e->csize);
+            fwrite(x, 1, 20, out);
+        }
+        if (e->csize) fwrite(e->blob, 1, (size_t)e->csize, out);
     }
-    long cd_start = (long)_ftelli64(out);
+
+    uint64_t cd_start = (uint64_t)_ftelli64(out);
     for (int i = 0; i < g_nfiles; i++) {
-        size_t nl = strlen(g_ents[i].name);
+        entry_t *e = &g_ents[i];
+        size_t nl = strlen(e->name);
+        int zu = g_force64 || e->usize >= U32MAX_;
+        int zc = g_force64 || e->csize >= U32MAX_;
+        int zo = g_force64 || e->off   >= U32MAX_;
+        int nz = zu + zc + zo;
+        unsigned char x[4 + 8 * 3];
+        uint16_t xl = 0;
+        if (nz) {
+            put16(x + 0, Z64_EXTRA_ID);
+            put16(x + 2, (uint16_t)(nz * 8));
+            uint16_t o = 4;
+            if (zu) { put64(x + o, e->usize); o += 8; }
+            if (zc) { put64(x + o, e->csize); o += 8; }
+            if (zo) { put64(x + o, e->off);   o += 8; }
+            xl = o;
+        }
         unsigned char cdh[46];
-        put32(cdh + 0, 0x02014b50);
-        put16(cdh + 4, 20); put16(cdh + 6, 20); put16(cdh + 8, 0); put16(cdh + 10, g_ents[i].method);
+        put32(cdh + 0, 0x02014b50u);
+        put16(cdh + 4, nz ? 45 : 20);   /* version made by */
+        put16(cdh + 6, nz ? 45 : 20);   /* version needed  */
+        put16(cdh + 8, e->gpflag);
+        put16(cdh + 10, e->method);
         put16(cdh + 12, 0); put16(cdh + 14, 0x5A21);
-        put32(cdh + 16, g_ents[i].crc); put32(cdh + 20, g_ents[i].csize); put32(cdh + 24, g_ents[i].usize);
-        put16(cdh + 28, (uint16_t)nl); put16(cdh + 30, 0); put16(cdh + 32, 0); put16(cdh + 34, 0);
-        put16(cdh + 36, 0); put32(cdh + 38, 0); put32(cdh + 42, g_ents[i].off);
+        put32(cdh + 16, e->crc);
+        put32(cdh + 20, zc ? U32MAX_ : (uint32_t)e->csize);
+        put32(cdh + 24, zu ? U32MAX_ : (uint32_t)e->usize);
+        put16(cdh + 28, (uint16_t)nl);
+        put16(cdh + 30, xl);
+        put16(cdh + 32, 0);
+        put16(cdh + 34, 0);
+        put16(cdh + 36, 0);
+        put32(cdh + 38, e->path ? 0x00000020u : 0x00000010u); /* DOS attr: file / dir */
+        put32(cdh + 42, zo ? U32MAX_ : (uint32_t)e->off);
         fwrite(cdh, 1, 46, out);
-        fwrite(g_ents[i].name, 1, nl, out);
+        fwrite(e->name, 1, nl, out);
+        if (nz) fwrite(x, 1, xl, out);
     }
-    long cd_end = (long)_ftelli64(out);
+
+    uint64_t cd_end = (uint64_t)_ftelli64(out);
+    uint64_t cd_size = cd_end - cd_start;
+    int need64 = g_force64 || g_nfiles >= U16MAX_ ||
+                 cd_start >= U32MAX_ || cd_size >= U32MAX_;
+    if (need64) {
+        uint64_t here = (uint64_t)_ftelli64(out);
+        unsigned char r[56];
+        put32(r + 0, 0x06064b50u);
+        put64(r + 4, 44);
+        put16(r + 12, 45); put16(r + 14, 45);
+        put32(r + 16, 0); put32(r + 20, 0);
+        put64(r + 24, (uint64_t)g_nfiles);
+        put64(r + 32, (uint64_t)g_nfiles);
+        put64(r + 40, cd_size);
+        put64(r + 48, cd_start);
+        fwrite(r, 1, 56, out);
+        unsigned char loc[20];
+        put32(loc + 0, 0x07064b50u);
+        put32(loc + 4, 0);
+        put64(loc + 8, here);
+        put32(loc + 16, 1);
+        fwrite(loc, 1, 20, out);
+    }
     unsigned char eocd[22];
-    put32(eocd + 0, 0x06054b50);
+    put32(eocd + 0, 0x06054b50u);
     put16(eocd + 4, 0); put16(eocd + 6, 0);
-    put16(eocd + 8, (uint16_t)g_nfiles); put16(eocd + 10, (uint16_t)g_nfiles);
-    put32(eocd + 12, (uint32_t)(cd_end - cd_start));
-    put32(eocd + 16, (uint32_t)cd_start);
+    put16(eocd + 8, need64 ? U16MAX_ : (uint16_t)g_nfiles);
+    put16(eocd + 10, need64 ? U16MAX_ : (uint16_t)g_nfiles);
+    put32(eocd + 12, need64 ? U32MAX_ : (uint32_t)cd_size);
+    put32(eocd + 16, need64 ? U32MAX_ : (uint32_t)cd_start);
     put16(eocd + 20, 0);
     fwrite(eocd, 1, 22, out);
     return 0;
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) { fprintf(stderr, "usage: %s <level> <out.zip> [--root] <file-or-dir1> [more...]\n"
-                                    "  --root : store directory contents at the archive root (needed for OOXML/OPC)\n", argv[0]); return 2; }
+    if (argc < 4) {
+        fprintf(stderr,
+            "usage: %s <level> <out.zip> [--root] <file-or-dir1> [more...]\n"
+            "  --root : store directory contents at the archive root (needed for OOXML/OPC)\n",
+            argv[0]);
+        return 2;
+    }
+    setlocale(LC_ALL, ".UTF-8");   /* so directory names round-trip as UTF-8 */
     g_level = (uint32_t)atoi(argv[1]);
     const char *outpath = argv[2];
+    g_force64 = getenv("ISAL_ZIP_FORCE64") != NULL;
 
     int root_mode = 0;
     for (int i = 3; i < argc; i++) if (!strcmp(argv[i], "--root")) root_mode = 1;
@@ -232,9 +334,10 @@ int main(int argc, char **argv) {
     double dt = now() - t0;
     if (rc != 0) return 1;
 
-    long long tin = 0, tout = 0;
-    for (int i = 0; i < g_nfiles; i++) { tin += g_ents[i].usize; tout += g_ents[i].csize; }
-    printf("ISAL_ZIP lvl%u threads=%d files=%d in=%lld deflated=%lld ratio=%.3f time=%.4fs -> %s\n",
-           g_level, threads, g_nfiles, tin, tout, (double)tin / (double)tout, dt, outpath);
+    unsigned long long tin = 0, tout = 0;
+    int nent = 0;
+    for (int i = 0; i < g_nfiles; i++) { tin += g_ents[i].usize; tout += g_ents[i].csize; if (g_ents[i].path) nent++; }
+    printf("ISAL_ZIP lvl%u threads=%d files=%d in=%llu deflated=%llu ratio=%.3f time=%.4fs -> %s\n",
+           g_level, threads, nent, tin, tout, tout ? (double)tin / (double)tout : 0.0, dt, outpath);
     return 0;
 }

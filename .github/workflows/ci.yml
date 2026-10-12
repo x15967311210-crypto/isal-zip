@@ -1,0 +1,78 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (MinGW-w64 toolchain)
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-ninja
+            make
+
+      - name: Download NASM
+        shell: pwsh
+        run: |
+          $url = "https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/win64/nasm-2.16.03-win64.zip"
+          Invoke-WebRequest -UseBasicParsing $url -OutFile nasm.zip
+          Expand-Archive nasm.zip -DestinationPath nasm
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $bin = Join-Path "${{ steps.msys2.outputs.msys2-location }}" "ucrt64\bin"
+          $env:PATH = "$bin;$env:PATH"
+          $nasm = (Resolve-Path ".\nasm\nasm-2.16.03\nasm.exe").Path
+          .\build.ps1 -Generator Ninja -Nasm $nasm -Gcc (Join-Path $bin "gcc.exe")
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $sevenZip = (Get-Command 7z -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) { $sevenZip = "C:\Program Files\7-Zip\7z.exe" }
+
+          New-Item -ItemType Directory -Force smoke\sub | Out-Null
+          Set-Content smoke\a.txt "hello isal-zip"
+          Set-Content smoke\sub\b.txt "nested file"
+          Set-Content "smoke\cafe-测试.txt" "中文内容" -Encoding UTF8
+
+          .\isal_zip.exe 1 smoke.zip --root smoke
+          if ($LASTEXITCODE) { throw "isal_zip failed" }
+
+          $env:ISAL_ZIP_THREADS = "4"
+          .\isal_zip.exe 1 smoke_mt.zip --root smoke
+          Remove-Item Env:\ISAL_ZIP_THREADS
+          if ($LASTEXITCODE) { throw "isal_zip (threads) failed" }
+
+          $env:ISAL_ZIP_FORCE64 = "1"
+          .\isal_zip.exe 1 smoke64.zip --root smoke
+          Remove-Item Env:\ISAL_ZIP_FORCE64
+          if ($LASTEXITCODE) { throw "isal_zip (zip64) failed" }
+
+          foreach ($z in "smoke.zip", "smoke_mt.zip", "smoke64.zip") {
+            & $sevenZip t $z
+            if ($LASTEXITCODE) { throw "7z t $z failed" }
+          }
+          Write-Host "smoke tests passed"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: isal-zip-win64
+          path: |
+            isal_zip.exe
+            isa-l.dll
+          if-no-files-found: error

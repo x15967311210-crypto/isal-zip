@@ -1,8 +1,12 @@
 # isal-zip
 
+[![ci](https://github.com/x15967311210-crypto/isal-zip/actions/workflows/ci.yml/badge.svg)](https://github.com/x15967311210-crypto/isal-zip/actions/workflows/ci.yml)
+
 A small Windows tool that builds **standard `.zip` archives** — including **OOXML**
 (`.docx` / `.xlsx` / `.pptx`) — using **Intel ISA-L**'s high-performance Deflate
 engine, plus the benchmark harness used to compare it against `7z.exe`.
+
+> 中文说明见 [README.zh-CN.md](README.zh-CN.md).
 
 Intel ISA-L (`igzip`) is a *compression library*: it produces raw Deflate/gzip
 streams but knows nothing about the ZIP container. This repo wraps it into a
@@ -17,6 +21,21 @@ minimal, spec-conformant ZIP writer and measures how it stacks up against
   closes the gap by compressing multiple files in parallel.
 * 7-Zip wins on **size**: even its fastest `-mx1` produces ~**9–10 % smaller**
   output, and `-mx5..-mx9` are *orders of magnitude* slower (multi-pass Deflate).
+
+## Features
+
+* Deflate via Intel ISA-L (`isal_deflate_stateless`), CRC-32 via
+  `crc32_gzip_refl`.
+* Recursive folder packaging; multiple threads (`ISAL_ZIP_THREADS`).
+* **ZIP64** — parts or archives larger than 4 GiB / >65535 entries.
+* **UTF-8 filename flag** (general-purpose bit 11) for non-ASCII names.
+* Explicit **directory entries**, and a **store fallback** when Deflate does not
+  shrink a part (e.g. already-compressed media).
+* **OOXML/OPC safe**: `--root` puts a folder's contents at the archive root and
+  `[Content_Types].xml` is forced to be the first entry.
+
+Prebuilt `isal_zip.exe` + `isa-l.dll` are attached to each
+[release](https://github.com/x15967311210-crypto/isal-zip/releases).
 
 ## Benchmark results
 
@@ -77,16 +96,23 @@ scales the same way via `ISAL_ZIP_THREADS`.)
 
 ## Build
 
-`isal_zip` links Intel ISA-L, so ISA-L must be built first. On Windows with
-NASM + MinGW-w64 gcc + CMake + `mingw32-make` + git on `PATH`:
+`isal_zip` links Intel ISA-L, so ISA-L must be built first. On Windows:
 
 ```powershell
-.\build.ps1
+.\build.ps1                 # MinGW Makefiles + NASM + MinGW gcc on PATH
+.\build.ps1 -Generator Ninja -Gcc C:\msys64\ucrt64\bin\gcc.exe
 ```
 
-The script clones Intel ISA-L (default `v2.32.1`), builds `isa-l.dll`, then
-compiles `src\isal_zip.c` against it. Use `-IsaLSrc C:\src\isa-l` to reuse an
-existing checkout.
+From an MSYS2 / MinGW shell:
+
+```bash
+./build.sh                  # clones ISA-L v2.32.1, builds dll + exe
+```
+
+Both scripts clone Intel ISA-L (default `v2.32.1`), build `isa-l.dll`, then
+compile `src\isal_zip.c` against it. Use `-IsaLSrc` / `ISAL_SRC` to reuse an
+existing checkout. CI (`.github/workflows/ci.yml`) builds and smoke-tests on
+`windows-latest`.
 
 ## Usage
 
@@ -97,6 +123,7 @@ isal_zip <level> <out.zip> [--root] <file-or-dir1> [<file-or-dir2> ...]
   --root         store a directory's *contents* at the archive root
                  (required for OOXML/OPC packages)
   env ISAL_ZIP_THREADS=N   compress N files in parallel (default 1)
+  env ISAL_ZIP_FORCE64=1   always emit ZIP64 records (for testing)
 ```
 
 Examples:
@@ -122,22 +149,23 @@ Conventions. Two rules matter for the zip writer:
 Everything else that 7-Zip/Word do (explicit directory entries, storing the
 content-types stream uncompressed) is *optional* — modern Office reads a ZIP
 where every part is Deflate-compressed and `[Content_Types].xml` is first.
-Verified by round-tripping real Word documents (including one with an embedded
-image) through `isal_zip --root` and reopening them in Word.
+`isal_zip` writes directory entries too and stores parts that Deflate cannot
+shrink. Verified by round-tripping real Word documents (including one with an
+embedded image) through `isal_zip --root` and reopening them in Word.
 
-Current limitations: no ZIP64 (> 4 GB / > 65535 entries), no explicit directory
-entries, no UTF-8 name flag, no encryption.
+Not implemented: encryption, data descriptors. (Neither is needed for OOXML.)
 
 ## Repository layout
 
 ```
-src/isal_zip.c      ZIP writer built on Intel ISA-L's isal_deflate_stateless()
-build.ps1           builds isa-l.dll + isal_zip.exe
-bench/bench_isal.py ISA-L (python-isal) vs 7z vs zlib, single stream
-bench/bench_zip.py  isal_zip.exe vs 7z, file or folder (end-to-end)
+src/isal_zip.c        ZIP writer built on Intel ISA-L's isal_deflate_stateless()
+build.ps1 / build.sh  build isa-l.dll + isal_zip.exe (PowerShell / MSYS2)
+.github/workflows/    CI: build + smoke test on windows-latest
+bench/bench_isal.py   ISA-L (python-isal) vs 7z vs zlib, single stream
+bench/bench_zip.py    isal_zip.exe vs 7z, file or folder (end-to-end)
 ```
 
 ## License
 
 BSD-3-Clause. Intel ISA-L itself is BSD-3-Clause and is **not** vendored here;
-fetch it via `build.ps1` / <https://github.com/intel/isa-l>.
+it is fetched by the build scripts / <https://github.com/intel/isa-l>.
