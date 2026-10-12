@@ -87,6 +87,22 @@ jobs:
 
           & $sevenZip t smoke_dll.zip
           if ($LASTEXITCODE) { throw "7z t smoke_dll.zip failed" }
+
+          # isal_zip.dll: isal_zip_rmtree removes a scratch tree (no cmd.exe/rd)
+          @'
+          import ctypes, os, sys
+          lib = ctypes.CDLL(os.path.abspath("isal_zip.dll"))
+          lib.isal_zip_rmtree.argtypes = [ctypes.c_char_p]
+          lib.isal_zip_rmtree.restype = ctypes.c_int
+          os.makedirs("scratch_tree/sub", exist_ok=True)
+          open("scratch_tree/sub/x.txt", "w").write("x")
+          rc1 = lib.isal_zip_rmtree(b"scratch_tree")
+          rc2 = lib.isal_zip_rmtree(b"scratch_tree")   # idempotent
+          print("rmtree rc:", rc1, rc2, "| gone:", not os.path.exists("scratch_tree"))
+          sys.exit(0 if rc1 == 0 and rc2 == 0 and not os.path.exists("scratch_tree") else 4)
+          '@ | Set-Content smoke_rmtree.py
+          python smoke_rmtree.py
+          if ($LASTEXITCODE) { throw "isal_zip_rmtree failed" }
           Write-Host "smoke tests passed"
 
       - name: Upload artifacts

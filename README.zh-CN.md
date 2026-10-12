@@ -128,10 +128,11 @@ isal_zip <level> <out.zip> [--root] <文件或目录1> [<文件或目录2> ...]
 ## 用 DLL 直接导出 zip（`isal_zip.dll`）
 
 同一个 ZIP 写入器也导出成动态库，宿主进程可以直接打包，不必再去调用 `isal_zip.exe`。
-只导出一个函数：
+导出两个函数：
 
 ```c
 int isal_zip_pack(const char *outZip, const char *rootDir, int level, int threads);
+int isal_zip_rmtree(const char *dir);
 ```
 
 | 参数 | 含义 |
@@ -143,6 +144,11 @@ int isal_zip_pack(const char *outZip, const char *rootDir, int level, int thread
 
 成功返回 `0`，失败返回非 0（路径参数为空返回 `2`）。因为源目录直接放在归档根，
 同样遵守 OPC 规则：若存在 `[Content_Types].xml`，会强制它成为第一个条目。
+
+`isal_zip_rmtree(dir)` 在**宿主进程内**递归删除一棵目录树——不需要 `cmd.exe`、
+`rd`，也不会弹窗口。参数是 UTF-8 路径；会清掉只读属性、不跟进 reparse point
+（junction/符号链接只删链接本身）；**路径不存在也算成功返回 0**，所以可以放心
+当"用前先清"的幂等步骤。非 0（空参数返回 `2`）表示有东西没删掉。
 
 `isal_zip.dll` 与 `isa-l.dll` 需在 DLL 搜索路径上（放在宿主程序旁边，或某个 `PATH`
 目录里）。`ISAL_ZIP_FORCE64=1` 仍可强制 ZIP64；`ISAL_ZIP_VERBOSE=1` 可让 DLL 也
@@ -156,6 +162,13 @@ lib = ctypes.CDLL(r"C:\path\to\isal_zip.dll")
 lib.isal_zip_pack.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
 lib.isal_zip_pack.restype = ctypes.c_int
 rc = lib.isal_zip_pack(b"out.docx", b"unpacked_docx", 1, 8)   # 0 表示成功
+```
+
+用完清理临时目录：
+
+```python
+lib.isal_zip_rmtree.argtypes = [ctypes.c_char_p]
+rc = lib.isal_zip_rmtree(b"unpacked_docx")                    # 0 表示成功（目录已不在也算）
 ```
 
 SAS 调用示例（SASCBTBL / `modulen`）：

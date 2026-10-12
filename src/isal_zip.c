@@ -26,6 +26,10 @@
  *     level   : ISA-L level 0..3
  *     threads : parallel worker threads (<=1 means single-threaded)
  *     returns 0 on success, non-zero on failure
+ *   int isal_zip_rmtree(const char *dir);
+ *     Recursively deletes `dir`. Returns 0 on success, also when the path does
+ *     not exist (idempotent). Lets a host clean its scratch tree without
+ *     spawning cmd.exe/rd.
  *
  * Build:
  *   gcc -O2 isal_zip.c <path>\isa-l.dll.a -I <build_include> -I <include> -o isal_zip.exe
@@ -35,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 #include <stdint.h>
 #include <locale.h>
 #include <windows.h>
@@ -385,6 +390,67 @@ static int pack_archive(const char *outpath, int level, int threads, int force64
 /* ------------------------------------------------------------------ */
 /* Library API (isal_zip.dll)                                          */
 /* ------------------------------------------------------------------ */
+
+/* Join a directory with a child name using a backslash. */
+static wchar_t *wjoin(const wchar_t *dir, const wchar_t *child) {
+    size_t ld = wcslen(dir), lc = wcslen(child);
+    wchar_t *r = (wchar_t *)malloc(sizeof(wchar_t) * (ld + lc + 2));
+    if (!r) return NULL;
+    memcpy(r, dir, sizeof(wchar_t) * ld);
+    r[ld] = L'\\';
+    memcpy(r + ld + 1, child, sizeof(wchar_t) * (lc + 1));
+    return r;
+}
+
+/* Recursive delete of one wide path. 1 = ok, 0 = failure. */
+static int rmtree_w(const wchar_t *path) {
+    DWORD attr = GetFileAttributesW(path);
+    if (attr == INVALID_FILE_ATTRIBUTES) return 1;          /* already gone */
+    if (attr & FILE_ATTRIBUTE_READONLY) SetFileAttributesW(path, FILE_ATTRIBUTE_NORMAL);
+    if ((attr & FILE_ATTRIBUTE_DIRECTORY) && !(attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        wchar_t *pat = wjoin(path, L"*");
+        if (!pat) return 0;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW(pat, &fd);
+        free(pat);
+        int ok = 1;
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+                wchar_t *child = wjoin(path, fd.cFileName);
+                if (!child) { ok = 0; break; }
+                if (!rmtree_w(child)) ok = 0;
+                free(child);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        if (!DeleteFileW(path) && !RemoveDirectoryW(path)) ok = 0;
+        return ok;
+    }
+    return DeleteFileW(path) ? 1 : (RemoveDirectoryW(path) ? 1 : 0);
+}
+
+/* Recursively delete `dir` (UTF-8 path). Returns 0 on success -- including when
+ * the path does not exist -- so callers can use it as an idempotent cleanup. */
+ZIP_EXPORT int isal_zip_rmtree(const char *dir) {
+    if (!dir || !dir[0]) return 2;
+    int n = MultiByteToWideChar(CP_UTF8, 0, dir, -1, NULL, 0);
+    if (n <= 0) return 3;
+    wchar_t *w = (wchar_t *)malloc(sizeof(wchar_t) * n);
+    if (!w) return 3;
+    MultiByteToWideChar(CP_UTF8, 0, dir, -1, w, n);
+    /* Never recurse through a reparse point: removing the link is enough. */
+    DWORD attr = GetFileAttributesW(w);
+    if (attr == INVALID_FILE_ATTRIBUTES) { free(w); return 0; }
+    if ((attr & FILE_ATTRIBUTE_REPARSE_POINT) && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        int rc = RemoveDirectoryW(w) ? 0 : 1;
+        free(w);
+        return rc;
+    }
+    int rc = rmtree_w(w) ? 0 : 1;
+    free(w);
+    return rc;
+}
 
 /* Pack `rootDir`'s contents at the archive root, keeping [Content_Types].xml
  * first so the result is a valid OOXML/OPC package. Returns 0 on success. */

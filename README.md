@@ -140,10 +140,11 @@ Examples:
 ## Using the DLL (`isal_zip.dll`)
 
 The same ZIP writer is exported as a shared library so a host process can pack
-directly — no shelling out to `isal_zip.exe`. One function is exported:
+directly — no shelling out to `isal_zip.exe`. Two functions are exported:
 
 ```c
 int isal_zip_pack(const char *outZip, const char *rootDir, int level, int threads);
+int isal_zip_rmtree(const char *dir);
 ```
 
 | arg | meaning |
@@ -156,6 +157,13 @@ int isal_zip_pack(const char *outZip, const char *rootDir, int level, int thread
 Returns `0` on success, non-zero on failure (`2` for a null/empty path argument).
 Because the source folder is packed *at the archive root*, the OPC first-entry
 rule applies: `[Content_Types].xml`, if present, is forced to be the first entry.
+
+`isal_zip_rmtree(dir)` recursively deletes a directory tree from inside the host
+process — no `cmd.exe`, `rd` or hidden console window. It takes a UTF-8 path,
+clears read-only attributes, never follows reparse points/junctions, and
+returns `0` on success **including when the path does not exist**, so it can be
+used as an idempotent "clean before use" step. Non-zero (`2` for null/empty)
+means something could not be removed.
 
 `isal_zip.dll` and `isa-l.dll` must be on the DLL search path (e.g. next to the
 host executable, or a directory on `PATH`). `ISAL_ZIP_FORCE64=1` still forces
@@ -170,6 +178,13 @@ lib = ctypes.CDLL(r"C:\path\to\isal_zip.dll")
 lib.isal_zip_pack.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
 lib.isal_zip_pack.restype = ctypes.c_int
 rc = lib.isal_zip_pack(b"out.docx", b"unpacked_docx", 1, 8)   # 0 == ok
+```
+
+Cleaning the scratch folder afterwards:
+
+```python
+lib.isal_zip_rmtree.argtypes = [ctypes.c_char_p]
+rc = lib.isal_zip_rmtree(b"unpacked_docx")                    # 0 == ok (even if gone)
 ```
 
 Calling it from SAS (SASCBTBL / `modulen`):
