@@ -88,6 +88,31 @@ jobs:
           & $sevenZip t smoke_dll.zip
           if ($LASTEXITCODE) { throw "7z t smoke_dll.zip failed" }
 
+          # --- chunk-parallel path: a file big enough to be split into several
+          # --- independent Deflate blocks must round-trip byte-for-byte (checks
+          # --- FULL_FLUSH concatenation and the combined CRC).
+          python -c "open('big.bin','wb').write((b'the quick brown fox jumps over the lazy dog '*40000)*8)"
+          $env:ISAL_ZIP_THREADS = "4"
+          .\isal_zip.exe 1 big_split.zip big.bin
+          Remove-Item Env:\ISAL_ZIP_THREADS
+          if ($LASTEXITCODE) { throw "isal_zip (split) failed" }
+          & $sevenZip t big_split.zip
+          if ($LASTEXITCODE) { throw "7z t big_split.zip failed" }
+          Expand-Archive big_split.zip -DestinationPath big_out -Force
+          $h1 = (Get-FileHash big.bin -Algorithm SHA256).Hash
+          $h2 = (Get-FileHash big_out\big.bin -Algorithm SHA256).Hash
+          if ($h1 -ne $h2) { throw "chunk-parallel round-trip mismatch: $h1 vs $h2" }
+
+          # splitting switched off must still produce a valid archive
+          $env:ISAL_ZIP_SPLIT = "0"
+          .\isal_zip.exe 1 big_nosplit.zip big.bin
+          Remove-Item Env:\ISAL_ZIP_SPLIT
+          if ($LASTEXITCODE) { throw "isal_zip (split off) failed" }
+          & $sevenZip t big_nosplit.zip
+          if ($LASTEXITCODE) { throw "7z t big_nosplit.zip failed" }
+          Write-Host ("split path: {0:N1} MB -> {1:N1} MB (split) / {2:N1} MB (single stream)" -f `
+            ((Get-Item big.bin).Length/1MB), ((Get-Item big_split.zip).Length/1MB), ((Get-Item big_nosplit.zip).Length/1MB))
+
           # isal_zip.dll: isal_zip_rmtree removes a scratch tree (no cmd.exe/rd)
           @'
           import ctypes, os, sys
