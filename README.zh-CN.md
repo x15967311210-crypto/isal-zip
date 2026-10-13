@@ -19,7 +19,10 @@ Intel ISA-L（`igzip`）是一个**压缩库**——它只产原始 Deflate/gzip
 ## 功能
 
 * 用 Intel ISA-L 的 `isal_deflate_stateless` 做 Deflate，CRC-32 用 `crc32_gzip_refl`。
-* 目录递归打包；多线程（`ISAL_ZIP_THREADS`）。
+* 全程使用 Win32 文件 I/O——`CreateFileW`/`ReadFile`（每个文件一次读取，不经 CRT stdio 的
+  4 KiB 中转缓冲），遍历用 `FindFirstFileW`（一次调用同时拿到属性和 64 位大小，省掉单独的 `stat`）。
+* 目录递归打包；多线程（`ISAL_ZIP_THREADS`）——既能跨文件并行，也能在**单个大文件内部**并行：
+  大文件被切成互相独立的 Deflate 块并行压缩后拼接。
 * **ZIP64**——支持超过 4 GiB 的部件或归档、超过 65535 个条目。
 * **UTF-8 文件名标志位**（通用位 11），自动为非 ASCII 名称置位。
 * 写显式**目录条目**；当 Deflate 压不小某个部件时**回退为存储**（如已压缩的媒体）。
@@ -111,7 +114,9 @@ isal_zip <level> <out.zip> [--root] <文件或目录1> [<文件或目录2> ...]
 
   level          ISA-L 压缩档位：0=store，1=最快，2，3=最优
   --root         把目录的“内容”放到归档根（OOXML/OPC 必需）
-  环境变量 ISAL_ZIP_THREADS=N   并行压缩 N 个文件（默认 1）
+  环境变量 ISAL_ZIP_THREADS=N   N 个 worker：并行压缩 N 个文件；单个大文件切成 N 块并行（默认 1）
+  环境变量 ISAL_ZIP_CHUNK=字节  切分大文件时每块大小的上限（默认 4 MiB，速度与压缩率折中）
+  环境变量 ISAL_ZIP_SPLIT=0     关闭单文件切分（只用文件级并行）
   环境变量 ISAL_ZIP_FORCE64=1   始终输出 ZIP64 记录（用于测试）
 ```
 

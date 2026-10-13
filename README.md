@@ -26,7 +26,12 @@ minimal, spec-conformant ZIP writer and measures how it stacks up against
 
 * Deflate via Intel ISA-L (`isal_deflate_stateless`), CRC-32 via
   `crc32_gzip_refl`.
-* Recursive folder packaging; multiple threads (`ISAL_ZIP_THREADS`).
+* Win32 file I/O throughout — `CreateFileW`/`ReadFile` (one read per file, no
+  CRT stdio bounce buffer) and `FindFirstFileW` for the walk (attributes and
+  64-bit size in one call, no separate `stat`).
+* Recursive folder packaging; multiple threads (`ISAL_ZIP_THREADS`) — across
+  files *and* within a single large file, which is split into independent
+  Deflate blocks that are compressed in parallel and concatenated.
 * **ZIP64** — parts or archives larger than 4 GiB / >65535 entries.
 * **UTF-8 filename flag** (general-purpose bit 11) for non-ASCII names.
 * Explicit **directory entries**, and a **store fallback** when Deflate does not
@@ -123,7 +128,11 @@ isal_zip <level> <out.zip> [--root] <file-or-dir1> [<file-or-dir2> ...]
   level          ISA-L compression level: 0=store, 1=fastest, 2, 3=best
   --root         store a directory's *contents* at the archive root
                  (required for OOXML/OPC packages)
-  env ISAL_ZIP_THREADS=N   compress N files in parallel (default 1)
+  env ISAL_ZIP_THREADS=N   run N workers: compress N files in parallel, and split
+                           one large file into N chunks (default 1)
+  env ISAL_ZIP_CHUNK=BYTES cap on the chunk size when splitting a large file
+                           (default 4 MiB; trades ratio against speed)
+  env ISAL_ZIP_SPLIT=0     disable single-file splitting (file-level threads only)
   env ISAL_ZIP_FORCE64=1   always emit ZIP64 records (for testing)
 ```
 
