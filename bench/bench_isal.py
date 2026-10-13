@@ -65,7 +65,7 @@ def sevenzip_zip(sevenzip, infile, level, outpath, runs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--data", required=True, help="input file to compress")
-    ap.add_argument("--7z", default=SEVENZIP_DEFAULT)
+    ap.add_argument("--7z", dest="sevenzip", default=SEVENZIP_DEFAULT)
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--workdir", default=os.getcwd())
     args = ap.parse_args()
@@ -89,7 +89,7 @@ def main():
 
     out_zip = os.path.join(args.workdir, "_bench_single.zip")
     for lvl in (1, 3, 5, 7, 9):
-        t, sz = sevenzip_zip(args.7z, args.data, lvl, out_zip, args.runs)
+        t, sz = sevenzip_zip(args.sevenzip, args.data, lvl, out_zip, args.runs)
         print(f"7z zip  mx{lvl} : {t*1000:8.1f} ms  {size/MB/t:8.1f} MB/s  ratio {size/sz:5.2f}")
 
 
